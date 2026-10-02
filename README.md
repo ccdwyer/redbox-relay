@@ -42,6 +42,14 @@ Engine calls it makes: `$.clock.now (via collect)`, `$.command.register`, `$.fs.
 
 A `tool.call` hook sits in the middle of every tool call: it can see the call, refuse it, or add context to its result. This mod uses that only for the behaviour described above.
 
+## Privacy
+
+It runs entirely on your machine. It sends nothing over the network. It reads logs from simulators and emulators on your machine with `xcrun simctl` and `adb`.
+
+The mod collects no analytics or telemetry, and its author receives no data from it.
+
+Full policy: [PRIVACY.md](PRIVACY.md).
+
 ## License
 
 MIT
