@@ -2,7 +2,7 @@
 
 ![Redbox Relay demo](media/demo.gif)
 
-*Claude edits `Info.plist` and the `Podfile`; Redbox Relay tells it a JS reload won't pick this up, and the status line tracks the pending native rebuild. ([MP4](media/demo.mp4))*
+*Claude edits `Info.plist` and the `Podfile`; Redbox Relay tells it a JS reload won't pick this up, and the status line tracks the pending native rebuild. ([MP4](https://github.com/ccdwyer/claude-mods/raw/main/media/redbox-relay.mp4))*
 
 A Claude Code mod for React Native work: the model sees what the running app just threw, without you copy-pasting redboxes.
 
@@ -28,3 +28,20 @@ Only prompts you type trigger it, not background notifications. With no simulato
 claude plugin validate .
 claude plugin test .
 ```
+
+## What it hooks
+
+Events this mod hooks, as `claude plugin validate` reads the module:
+
+- `session.start`
+- `command.run{command=redbox}`
+- `prompt.submit`
+- `tool.call`
+
+Engine calls it makes: `$.clock.now (via collect)`, `$.command.register`, `$.fs.exists (via exists)`, `$.fs.list (via listDirs)`, `$.fs.read (via readText)`, `$.fs.stat (via real`, `snapshot)`, `$.process.run (via run)`, `$.session.cwd`, `$.state.get`, `$.state.set`, `$.store.get`, `$.store.set`, `$.ui.status`, `$.ui.toast`.
+
+A `tool.call` hook sits in the middle of every tool call: it can see the call, refuse it, or add context to its result. This mod uses that only for the behaviour described above.
+
+## License
+
+MIT
