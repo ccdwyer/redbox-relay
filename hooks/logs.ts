@@ -138,6 +138,12 @@ const KEYS = [
 ].join('|')
 
 const SECRETS: [RegExp, string][] = [
+  // A complete PEM private key block, metadata (Proc-Type, DEK-Info) and short last line included.
+  [/-----BEGIN ([A-Z0-9 ]*)PRIVATE KEY-----[\s\S]*?-----END \1PRIVATE KEY-----/g, '[redacted-private-key]'],
+  // A key cut off before its END line: the header, metadata lines and base64 lines that follow it.
+  [/-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----(?:[ \t]*\r?\n(?:[A-Za-z0-9+/]{16,}={0,2}|[A-Za-z0-9+/]*={1,2}|(?:Proc-Type|DEK-Info|Comment):[^\n]*|[ \t]*(?=\r?\n)))*/g, '[redacted-private-key]'],
+  // Google API keys (their alphabet includes `-`, so a word boundary is not enough).
+  [/(?<![0-9A-Za-z_-])AIza[0-9A-Za-z_-]{35}(?![0-9A-Za-z_-])/g, '[redacted-google-key]'],
   // Whole header values: everything after the header name is the credential.
   [/\b(authorization|proxy-authorization|cookie|set-cookie|x-api-key|x-auth-token)(["']?\s*[:=]\s*)[^\n]+/gi, '$1$2[redacted]'],
   [/\b(bearer|basic)\s+[A-Za-z0-9._~+/=-]{8,}/gi, '$1 [redacted]'],

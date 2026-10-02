@@ -4,8 +4,8 @@ import type { EngineInterface, Register } from 'claude-code'
 import type { Pending } from '../types'
 import { ANDROID_FILTER, IOS_PREDICATE, androidEvents, bare, dedupe, fit, iosEvents, label, scrubLines } from './logs'
 import type { AppIdentity, LogEvent } from './logs'
-import { commandsOf, effectOf, impactOf } from './native'
-import type { Impact, Platform, Step } from './native'
+import { commandsOf, effectOf, impactOf, timelineOf, writes } from './native'
+import type { CommandContext, Impact, Platform, Step } from './native'
 
 const cursors = atom({ plugin: 'redbox-relay', key: 'cursors' } as const, {})
 const delivered = atom({ plugin: 'redbox-relay', key: 'delivered' } as const, [])
@@ -22,11 +22,8 @@ const MAX_DEVICES = 3
 const AUTO_KEY = 'auto'
 // Files whose whole before/after decides whether a change is native.
 const WHOLE_FILE = /(^|\/)(app\.json|app\.config\.(js|ts|mjs|cjs)|package\.json)$/
-// Commands that cannot change files: no need to look for native changes around them.
-const READ_ONLY = new Set(['ls', 'cat', 'head', 'tail', 'grep', 'rg', 'find', 'echo', 'pwd', 'which', 'wc', 'less', 'tree', 'stat', 'file', 'du', 'df', 'ps', 'env', 'printenv', 'date', 'adb', 'xcrun'])
-const READ_ONLY_GIT = new Set(['status', 'diff', 'log', 'show', 'blame', 'branch', 'remote', 'rev-parse', 'ls-files', 'grep'])
 
-type App = { root: string; name?: string; identity: AppIdentity; platforms: Platform[]; scripts: Record<string, string> }
+type App = { root: string; name?: string; identity: AppIdentity; platforms: Platform[]; scripts: Record<string, string>; autoPods: boolean }
 type Source = { source: string; label: string; events: LogEvent[]; omitted: number; isTruncated: boolean }
 type Collected = { found: Source[]; failed: string[]; reads: Record<string, number> }
 
@@ -88,9 +85,20 @@ const parentOf = (dir: string) => dir.replace(/\/[^/]+\/?$/, '') || '/'
 async function appScore($: EngineInterface, dir: string): Promise<number> {
   let score = 0
   if ((await exists($, `${dir}/ios`)) || (await exists($, `${dir}/android`))) score += 2
-  for (const f of ['app.json', 'app.config.js', 'app.config.ts']) if (await exists($, `${dir}/${f}`)) score += 1
+  for (const f of ['app.json', 'app.config.js', 'app.config.ts', 'app.config.mjs', 'app.config.cjs']) if (await exists($, `${dir}/${f}`)) score += 1
   if (/\/apps?\//.test(dir)) score += 1
   return score
+}
+
+// A monorepo root (workspaces, or pnpm-workspace.yaml) with no native folders or Expo config of its own.
+async function isToolingRoot($: EngineInterface, dir: string, pkg: Record<string, unknown> | null): Promise<boolean> {
+  const isWorkspace = (pkg !== null && pkg.workspaces !== undefined) || (await exists($, `${dir}/pnpm-workspace.yaml`))
+  if (!isWorkspace) return false
+  if ((await exists($, `${dir}/ios`)) || (await exists($, `${dir}/android`))) return false
+  for (const f of ['app.config.js', 'app.config.ts', 'app.config.mjs', 'app.config.cjs']) if (await exists($, `${dir}/${f}`)) return false
+  // A bare app.json (name/displayName) is not an Expo config; only one with an `expo` key is.
+  const appJson = await readJson($, `${dir}/app.json`)
+  return appJson === null || appJson.expo === undefined
 }
 
 // The nearest package at or above `dir` that depends on react-native or expo.
@@ -98,7 +106,9 @@ async function appAbove($: EngineInterface, dir: string): Promise<App | null> {
   let at = dir
   for (let depth = 0; depth < 10; depth += 1) {
     const pkg = await readJson($, `${at}/package.json`)
-    if (isRnPackage(pkg)) return appAt($, at, pkg)
+    // A workspace root that lists react-native or expo only as tooling is not the app:
+    // leave it to the workspace scorer.
+    if (isRnPackage(pkg) && !(await isToolingRoot($, at, pkg))) return appAt($, at, pkg)
     const up = parentOf(at)
     if (up === at) return null
     at = up
@@ -166,7 +176,10 @@ async function appAt($: EngineInterface, root: string, pkg: Record<string, unkno
     Object.entries((pkg?.scripts ?? {}) as Record<string, unknown>).filter((kv): kv is [string, string] => typeof kv[1] === 'string'),
   )
   const name = typeof pkg?.name === 'string' ? pkg.name : undefined
-  return { root, name, identity: await identityOf($, root, pkg), platforms, scripts }
+  // RN CLI 0.73+: `automaticPodsInstallation: true` in react-native.config.js makes run-ios reinstall pods when the Podfile changed.
+  const rnConfig = (await readText($, `${root}/react-native.config.js`)) ?? ''
+  const autoPods = /automaticPodsInstallation\s*:\s*true/.test(rnConfig)
+  return { root, name, identity: await identityOf($, root, pkg), platforms, scripts, autoPods }
 }
 
 const str = (v: unknown) => (typeof v === 'string' && v !== '' ? v : undefined)
@@ -384,7 +397,7 @@ function settle(list: Pending[], root: string, steps: Step[], startedAt: number)
       if (p.root !== root || p.gen > startedAt) return p
       let { platforms, pods } = p
       for (const step of steps) {
-        if (step.kind === 'pods') pods = false
+        if (step.kind === 'pods') pods = pods && step.podfileOnly === true && p.file.endsWith('.podspec')
         else if (step.platform === 'android' || !pods) platforms = platforms.filter(x => x !== step.platform)
       }
       return { ...p, platforms, pods: pods && platforms.includes('ios') }
@@ -394,12 +407,13 @@ function settle(list: Pending[], root: string, steps: Step[], startedAt: number)
 
 // Changed paths and their modification times under an app, per git: the
 // before/after snapshot that catches native edits made through the shell.
-type Snap = Map<string, { mtime: number; text?: string }>
+type Snap = { files: Map<string, { mtime: number; text?: string }>; head: string | null; lead: string }
 
 // Changed native paths under an app, per git, with modification times (and the
 // text of the config files whose meaning depends on content): the before/after
 // snapshot that catches native edits made through the shell.
 async function snapshot($: EngineInterface, root: string): Promise<Snap | null> {
+  const headRun = await run($, ['git', 'rev-parse', '--verify', '-q', 'HEAD'], 4000, root)
   // One after the other: the directory reads $ only as a plain argument, not inside an array literal.
   const prefix = await run($, ['git', 'rev-parse', '--show-prefix'], 4000, root)
   const status = await run($, ['git', 'status', '--porcelain=v1', '-z', '--untracked-files=all', '--', '.'], 4000, root)
@@ -407,7 +421,7 @@ async function snapshot($: EngineInterface, root: string): Promise<Snap | null> 
   // git reports paths from the repository's top; make them relative to the app.
   const lead = prefix.stdout.trim()
   const entries = status.stdout.split('\0')
-  const paths = new Set<string>(['app.json', 'app.config.js', 'app.config.ts', 'package.json'])
+  const paths = new Set<string>(['app.json', 'app.config.js', 'app.config.ts', 'app.config.mjs', 'app.config.cjs', 'package.json'])
   for (let i = 0; i < entries.length; i += 1) {
     const entry = entries[i] as string
     if (entry.length < 4) continue
@@ -418,7 +432,7 @@ async function snapshot($: EngineInterface, root: string): Promise<Snap | null> 
     const rel = path.slice(lead.length)
     if (impactOf(rel) !== null) paths.add(rel)
   }
-  const snap: Snap = new Map()
+  const files: Snap['files'] = new Map()
   for (const p of [...paths].slice(0, 200)) {
     let mtime = -1
     try {
@@ -426,22 +440,61 @@ async function snapshot($: EngineInterface, root: string): Promise<Snap | null> 
     } catch {
       if (WHOLE_FILE.test(p)) continue
     }
-    snap.set(p, WHOLE_FILE.test(p) ? { mtime, text: (await readText($, `${root}/${p}`)) ?? undefined } : { mtime })
+    files.set(p, WHOLE_FILE.test(p) ? { mtime, text: (await readText($, `${root}/${p}`)) ?? undefined } : { mtime })
   }
-  return snap
+  const head = headRun !== null && headRun.exitCode === 0 ? headRun.stdout.trim() : null
+  return { files, head, lead }
+}
+
+// Native paths (relative to the app) that commits made between two snapshots changed:
+// a command that edits and commits leaves nothing dirty for the status listing.
+async function committedBetween($: EngineInterface, root: string, was: Snap, now: Snap): Promise<string[]> {
+  if (was.head === null || now.head === null || was.head === now.head) return []
+  const diff = await run($, ['git', 'diff', '--name-only', '-z', was.head, now.head, '--', '.'], 4000, root)
+  if (diff === null || diff.exitCode !== 0) return []
+  return diff.stdout
+    .split('\0')
+    .filter(path => path !== '' && path.startsWith(now.lead))
+    .map(path => path.slice(now.lead.length))
+    .filter(rel => impactOf(rel) !== null)
 }
 
 // Whether any part of a shell line could change files.
 function mayWrite(command: string): boolean {
   const parsed = commandsOf(command)
   if (parsed.isOpaque || /[^0-9&]>|^>/.test(command)) return true
-  return parsed.commands.some(c => {
-    const head = c.words[0] ?? ''
-    if (head === '') return false
-    if (head === 'git') return !READ_ONLY_GIT.has(c.words[1] ?? '')
-    return !READ_ONLY.has(head)
-  })
+  return parsed.commands.some(c => writes(c.words))
 }
+
+// Which platforms a command's own builds provably cover for files it changed itself.
+// A build covers a platform only when nothing after it changes files (a plain write, a
+// wrapped script that writes, or a pods/prebuild step). An iOS change needing pods is
+// covered only when a pods step runs after the last such change and no later than the build.
+function coveredBy(command: string, ctx: CommandContext): { platforms: Platform[]; pods: boolean; podfileOnly: boolean } {
+  const none = { platforms: [] as Platform[], pods: false, podfileOnly: false }
+  const parsed = commandsOf(command)
+  if (parsed.isOpaque || /[^0-9&]>|^>/.test(command)) return none
+  let lastMut = -1
+  let lastUserWrite = -1
+  let lastPods = -1
+  let podfileOnly = false
+  const lastBuild: Partial<Record<Platform, number>> = {}
+  timelineOf(command, ctx).forEach((part, i) => {
+    if (part.mutates) lastMut = i
+    if (part.mutates && !part.steps.some(st => st.kind === 'pods')) lastUserWrite = i
+    for (const step of part.steps) {
+      if (step.kind === 'pods') {
+        lastPods = i
+        podfileOnly = step.podfileOnly === true
+      } else lastBuild[step.platform] = i
+    }
+  })
+  // A part that both builds and writes (a script that builds then patches) covers nothing.
+  const platforms = (['ios', 'android'] as const).filter(p => (lastBuild[p] ?? -1) > lastMut)
+  const ios = lastBuild.ios ?? -1
+  return { platforms, pods: lastPods > lastUserWrite && lastPods <= ios, podfileOnly }
+}
+
 
 async function track($: EngineInterface, app: App, rel: string, impact: Impact): Promise<Platform[]> {
   const platforms = impact.platforms.filter(p => app.platforms.includes(p))
@@ -538,12 +591,12 @@ export const register: Register = on => {
       const failed = ran.isError === true
 
       const notes: string[] = []
-      const built = new Map<string, Platform[]>()
+      const covered = new Map<string, { platforms: Platform[]; pods: boolean; podfileOnly: boolean }>()
       for (const root of failed ? [] : roots) {
         const app = apps.find(a => a.root === root) ?? (await appAbove($, root))
-        const ctx = { cwd, root, scripts: app?.scripts ?? {}, name: app?.name }
+        const ctx = { cwd, root, scripts: app?.scripts ?? {}, name: app?.name, autoPods: app?.autoPods === true }
         const effect = effectOf(e.command, ctx)
-        built.set(root, effect.steps.flatMap(st => (st.kind === 'build' ? [st.platform] : [])))
+        covered.set(root, coveredBy(e.command, ctx))
         if (effect.steps.length > 0) {
           const now = await update($, pending, list => settle(list, root, effect.steps, startedAt))
           $.ui.status(statusFor(now))
@@ -561,15 +614,19 @@ export const register: Register = on => {
         const appRoot = app.root
         const after = await snapshot($, appRoot)
         if (after === null) continue
+        const committed = new Set(await committedBetween($, appRoot, was, after))
         // Files changed in either direction, a revert to the committed version included.
-        for (const rel of new Set([...was.keys(), ...after.keys()])) {
-          const a = was.get(rel)
-          const b = after.get(rel)
-          if (a?.mtime === b?.mtime && a?.text === b?.text) continue
+        for (const rel of new Set([...was.files.keys(), ...after.files.keys(), ...committed])) {
+          const a = was.files.get(rel)
+          const b = after.files.get(rel)
+          if (!committed.has(rel) && a?.mtime === b?.mtime && a?.text === b?.text) continue
           const impact = WHOLE_FILE.test(rel) ? impactOf(rel, a?.text ?? '', b?.text ?? '') : impactOf(rel)
           if (impact === null) continue
-          // A build later in the same command already compiled this change.
-          const skip = built.get(app.root) ?? []
+          // A build later in the same command already compiled this change; a change
+          // needing pods is covered on iOS only if a pod install ran in between.
+          const cover = covered.get(app.root) ?? { platforms: [], pods: false, podfileOnly: false }
+          const podsCovered = cover.pods && !(cover.podfileOnly && rel.endsWith('.podspec'))
+          const skip = cover.platforms.filter(p => p !== 'ios' || !impact.pods || podsCovered)
           const left = { ...impact, platforms: impact.platforms.filter(p => !skip.includes(p)) }
           if (left.platforms.length === 0) continue
           const platforms = await track($, app, rel, left)

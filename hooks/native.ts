@@ -8,6 +8,8 @@ export type Impact = { platforms: Platform[]; pods: boolean; note: string; soft?
 const IOS_SOURCE = /\.(swift|m|mm|xib|storyboard|xcconfig|entitlements|plist|pbxproj|xcscheme)$/
 const ANDROID_SOURCE = /\.(kt|kts|java|gradle)$/
 const SHARED_SOURCE = /\.(h|hpp|c|cc|cpp)$/
+// Files that are native build input wherever they sit inside a module's ios/ or android/ folder.
+const NESTED_NATIVE = /\.(swift|m|mm|xib|storyboard|xcconfig|entitlements|plist|pbxproj|xcscheme|kt|kts|java|gradle|h|hpp|c|cc|cpp|xml|properties|pro|cmake)$|^CMakeLists\.txt$/
 const SCRIPT = /\.(js|jsx|ts|tsx|mjs|cjs|mts|cts|md|mdx|txt|json)$/
 const EXPO_JSON = /^app\.json$/
 const EXPO_SCRIPT = /^app\.config\.(js|ts|mjs|cjs)$/
@@ -33,9 +35,12 @@ export function impactOf(rel: string, before?: string, after?: string): Impact |
 
   const inIos = dirs.includes('ios')
   const inAndroid = dirs.includes('android')
-  if (inIos || inAndroid) {
-    // Native project folders, the app's or a local/patched module's; scripts and JSON assets in them are not compiled.
-    if (SCRIPT.test(base) && !/^google-services\.json$|^Contents\.json$/.test(base)) return null
+  // The app's own native project (ios/ or android/ at the root) counts whole; a folder of that
+  // name deeper down (a module's, or just scripts/android/) counts only for native file types.
+  const atRoot = dirs[0] === 'ios' || dirs[0] === 'android'
+  if ((inIos || inAndroid) && (atRoot || NESTED_NATIVE.test(base))) {
+    // Scripts and JSON assets in native folders are not compiled.
+    if (SCRIPT.test(base) && !/^google-services\.json$|^Contents\.json$|^CMakeLists\.txt$/.test(base)) return null
     const platforms: Platform[] = [...(inIos ? ['ios' as const] : []), ...(inAndroid ? ['android' as const] : [])]
     const where = dirs[0] === 'ios' || dirs[0] === 'android' ? `the ${inIos ? 'Xcode' : 'Android'} project` : 'a native module'
     return { platforms, pods: false, note: `${where} changed` }
@@ -151,7 +156,7 @@ function changedDependencies(before: string, after: string): string[] {
 
 // ---- Commands ----
 
-export type Step = { kind: 'pods' } | { kind: 'build'; platform: Platform }
+export type Step = { kind: 'pods'; podfileOnly?: boolean } | { kind: 'build'; platform: Platform }
 export type CommandEffect = { steps: Step[]; installs: string[] }
 export type CommandContext = {
   // The directory the command starts in, and the app it must build to count.
@@ -160,6 +165,20 @@ export type CommandContext = {
   // The app's package.json scripts and package name, to expand `npm run ios` and match workspace selectors.
   scripts: Record<string, string>
   name?: string
+  // react-native.config.js sets `automaticPodsInstallation: true`: the RN CLI's run-ios/build-ios reinstalls pods when the Podfile changed.
+  autoPods?: boolean
+}
+
+// Commands that only read. Everything else may change files.
+const READ_ONLY = new Set(['ls', 'cat', 'head', 'tail', 'grep', 'rg', 'echo', 'pwd', 'which', 'wc', 'less', 'tree', 'stat', 'file', 'du', 'df', 'ps', 'printenv', 'date', 'adb'])
+const READ_ONLY_GIT = new Set(['status', 'diff', 'log', 'show', 'blame', 'branch', 'remote', 'rev-parse', 'ls-files', 'grep'])
+
+/** Whether one simple command could change files. */
+export function writes(words: string[]): boolean {
+  const head = (words[0] ?? '').split('/').pop() ?? ''
+  if (head === '') return false
+  if (head === 'git') return !READ_ONLY_GIT.has(words[1] ?? '')
+  return !READ_ONLY.has(head)
 }
 
 type Simple = { words: string[]; op: string }
@@ -275,6 +294,9 @@ const resolve = (cwd: string, path: string) => {
   return `/${out.join('/')}`
 }
 const inside = (dir: string, root: string) => dir === root || dir.startsWith(`${root}/`)
+// Somewhere inside the app other than its root and its own native folders (an example app, a package).
+const beneathApp = (ctx: CommandContext) =>
+  ctx.cwd !== ctx.root && !inside(ctx.cwd, `${ctx.root}/ios`) && !inside(ctx.cwd, `${ctx.root}/android`)
 
 // `--flag value` or `--flag=value`.
 function optValue(args: string[], flag: string): string | undefined {
@@ -304,9 +326,24 @@ const platformOf = (args: string[]): string => {
  * part of the line), for a soft note.
  */
 export function effectOf(line: string, ctx: CommandContext, depth = 0): CommandEffect {
-  const parsed = commandsOf(line)
   const installs: string[] = []
   const steps: Step[] = []
+  for (const part of timelineOf(line, ctx, depth)) {
+    steps.push(...part.steps)
+    installs.push(...part.installs)
+  }
+  return { steps, installs }
+}
+
+/**
+ * The line's simple commands in order, each with the steps it provably took
+ * (empty when it is not credited) and whether it is a `cd`.
+ */
+export type Part = { words: string[]; steps: Step[]; installs: string[]; isCd: boolean; mutates: boolean }
+
+export function timelineOf(line: string, ctx: CommandContext, depth = 0): Part[] {
+  const parsed = commandsOf(line)
+  const out: Part[] = []
   const trusted = new Set(parsed.isOpaque ? [] : proven(parsed.commands))
   // null: the directory is no longer known, so nothing after it is credited.
   let cwd: string | null = ctx.cwd
@@ -318,16 +355,18 @@ export function effectOf(line: string, ctx: CommandContext, depth = 0): CommandE
       const certain = trusted.has(c) || (i === 0 && c.op === ';')
       cwd = certain ? sub.cd : null
     }
-    const counts = trusted.has(c) && cwd !== null && inside(cwd, ctx.root)
-    if (counts) {
-      steps.push(...sub.steps)
-      installs.push(...sub.installs)
-    }
+    const counts = trusted.has(c) && cwd !== null && (inside(cwd, ctx.root) || sub.owned === true)
+    const steps = counts ? sub.steps : []
+    const isCd = sub.cd !== undefined
+    // Changed files: a plain write, a pods-only step (pod install, prebuild), or a write inside a wrapped script.
+    const podsOnly = steps.length > 0 && steps.every(st => st.kind === 'pods')
+    const mutates = !isCd && ((steps.length === 0 && writes(c.words)) || podsOnly || sub.mutates === true)
+    out.push({ words: c.words, steps, installs: counts ? sub.installs : [], isCd, mutates })
   }
-  return { steps, installs }
+  return out
 }
 
-type Interpreted = { steps: Step[]; installs: string[]; cd?: string | null }
+type Interpreted = { steps: Step[]; installs: string[]; cd?: string | null; owned?: boolean; mutates?: boolean }
 
 function interpret(words: string[], ctx: CommandContext, depth: number): Interpreted {
   const none: Interpreted = { steps: [], installs: [] }
@@ -353,39 +392,56 @@ function interpret(words: string[], ctx: CommandContext, depth: number): Interpr
   if ((head === 'bash' || head === 'sh' || head === 'zsh') && depth < 3) {
     const i = args.findIndex(a => /^-\w*c\w*$/.test(a))
     if (i >= 0 && args[i + 1] !== undefined) {
-      const inner = effectOf(args[i + 1] as string, ctx, depth + 1)
-      return { steps: inner.steps, installs: inner.installs }
+      const parts = timelineOf(args[i + 1] as string, ctx, depth + 1)
+      return {
+        steps: parts.flatMap(p => p.steps),
+        installs: parts.flatMap(p => p.installs),
+        mutates: parts.some(p => p.mutates),
+      }
     }
-    return none
+    return { ...none, mutates: true }
   }
 
   if (head === 'xcodebuild') {
     if (args.some(a => XCODE_INFO.has(a))) return none
+    const iosDir = `${ctx.root}/ios`
+    let named = false
     for (const flag of ['-workspace', '-project']) {
       const i = args.indexOf(flag)
-      if (i >= 0 && !inside(resolve(ctx.cwd, args[i + 1] ?? ''), ctx.root)) return none
+      if (i < 0) continue
+      named = true
+      if (!inside(resolve(ctx.cwd, args[i + 1] ?? ''), iosDir)) return none
     }
+    if (!named && !inside(ctx.cwd, iosDir)) return none
     const hasTarget = args.some(a => ['-scheme', '-workspace', '-project', '-target'].includes(a))
     return args.some(a => XCODE_ACTIONS.has(a)) || (hasTarget && !args.includes('clean'))
       ? { ...none, steps: [{ kind: 'build', platform: 'ios' }] }
       : none
   }
   if (head === 'gradlew' || head === 'gradle') {
-    for (const dir of [optValue(args, '-p'), optValue(args, '--project-dir'), wrapperDir(w[0] ?? '')]) {
-      if (dir !== undefined && !inside(resolve(ctx.cwd, dir), ctx.root)) return none
+    const androidDir = `${ctx.root}/android`
+    const dirs = [optValue(args, '-p'), optValue(args, '--project-dir'), wrapperDir(w[0] ?? '')].filter((d): d is string => d !== undefined)
+    if (dirs.length > 0 ? dirs.some(d => resolve(ctx.cwd, d) !== androidDir) : !inside(ctx.cwd, androidDir)) return none
+    // `:lib:assembleRelease` builds a library; only the app project (or the whole build) counts.
+    const appTask = (a: string) => {
+      const path = a.split(':').filter(x => x !== '')
+      return path.length <= 1 || (path.length === 2 && path[0] === 'app')
     }
-    return args.some(a => GRADLE_BUILD.test(a) && !GRADLE_PARTIAL.test(a)) ? { ...none, steps: [{ kind: 'build', platform: 'android' }] } : none
+    return args.some(a => GRADLE_BUILD.test(a) && !GRADLE_PARTIAL.test(a) && appTask(a)) ? { ...none, steps: [{ kind: 'build', platform: 'android' }] } : none
   }
-  if ((head === 'pod' && args[0] === 'install') || head === 'pod-install') {
+  if ((head === 'pod' && (args[0] === 'install' || args[0] === 'update')) || head === 'pod-install') {
     const dir = optValue(args, '--project-directory') ?? (head === 'pod-install' ? args.find(a => !a.startsWith('-')) : undefined)
-    if (dir !== undefined && !inside(resolve(ctx.cwd, dir), ctx.root)) return none
+    const iosDir = `${ctx.root}/ios`
+    // `pod install` needs the Podfile's folder; `pod-install` (npx) finds ios/ from the app root itself.
+    const here = head === 'pod-install' ? inside(ctx.cwd, ctx.root) && !beneathApp(ctx) : inside(ctx.cwd, iosDir)
+    if (dir !== undefined ? resolve(ctx.cwd, dir) !== iosDir : !here) return none
     return { ...none, steps: [{ kind: 'pods' }] }
   }
-  if (head === 'expo' || head === 'react-native') return expoLike(head, args)
+  if (head === 'expo' || head === 'react-native') return inside(ctx.cwd, ctx.root) && !beneathApp(ctx) ? expoLike(head, args, ctx) : none
   if (head === 'eas' && args[0] === 'build' && args.includes('--local')) {
     const p = platformOf(args)
     const steps: Step[] = []
-    if (p === 'ios' || p === 'all') steps.push({ kind: 'build', platform: 'ios' })
+    if (p === 'ios' || p === 'all') steps.push({ kind: 'pods' }, { kind: 'build', platform: 'ios' })
     if (p === 'android' || p === 'all') steps.push({ kind: 'build', platform: 'android' })
     return { ...none, steps }
   }
@@ -393,16 +449,23 @@ function interpret(words: string[], ctx: CommandContext, depth: number): Interpr
   return none
 }
 
-function expoLike(head: string, args: string[]): Interpreted {
+function expoLike(head: string, args: string[], ctx: CommandContext): Interpreted {
   const sub = args[0] ?? ''
   const steps: Step[] = []
   const installs: string[] = []
-  if (sub === 'run:ios' || sub === 'run-ios') {
-    // Both CLIs install pods before building, unless told not to.
+  if (head === 'expo' && sub === 'run:ios') {
+    // Expo installs pods before building, unless told not to.
     if (!args.includes('--no-install') && !args.includes('--no-pods')) steps.push({ kind: 'pods' })
     steps.push({ kind: 'build', platform: 'ios' })
   }
-  if (sub === 'run:android' || sub === 'run-android') steps.push({ kind: 'build', platform: 'android' })
+  if (head === 'react-native' && (sub === 'run-ios' || sub === 'build-ios')) {
+    // The RN CLI reinstalls pods when forced, or (with automaticPodsInstallation) when the
+    // Podfile's hash changed; it never looks at .podspec sources.
+    if (args.includes('--force-pods') || args.includes('--only-pods')) steps.push({ kind: 'pods' })
+    else if (ctx.autoPods === true) steps.push({ kind: 'pods', podfileOnly: true })
+    if (!args.includes('--only-pods')) steps.push({ kind: 'build', platform: 'ios' })
+  }
+  if (sub === 'run:android' || sub === 'run-android' || (head === 'react-native' && sub === 'build-android')) steps.push({ kind: 'build', platform: 'android' })
   if (head === 'expo' && sub === 'prebuild' && !args.includes('--no-install')) {
     const p = platformOf(args)
     if (p === 'ios' || p === 'all') steps.push({ kind: 'pods' })
@@ -443,13 +506,18 @@ function runner(head: string, args: string[], ctx: CommandContext, depth: number
   const cmd = rest[0] ?? ''
   if (['add', 'install', 'i'].includes(cmd)) return { ...none, installs: rest.slice(1).filter(a => !a.startsWith('-')) }
   // `yarn expo run:ios`, `pnpm react-native run-android`.
-  if (cmd === 'expo' || cmd === 'react-native') return expoLike(cmd, rest.slice(1))
+  if (cmd === 'expo' || cmd === 'react-native') return { ...expoLike(cmd, rest.slice(1), ctx), owned: selected !== undefined }
   const name = cmd === 'run' || cmd === 'run-script' ? rest[1] : cmd
   if (name === undefined || depth >= 3) return none
   const body = ctx.scripts[name]
   if (body === undefined) return none
   // Expand the script with its pre/post hooks; its body decides what it does.
   const chain = [ctx.scripts[`pre${name}`], body, ctx.scripts[`post${name}`]].filter((s): s is string => s !== undefined).join(' && ')
-  const inner = effectOf(chain, { ...ctx, cwd: ctx.root }, depth + 1)
-  return { steps: inner.steps, installs: inner.installs }
+  const parts = timelineOf(chain, { ...ctx, cwd: ctx.root }, depth + 1)
+  return {
+    steps: parts.flatMap(p => p.steps),
+    installs: parts.flatMap(p => p.installs),
+    owned: selected !== undefined,
+    mutates: parts.some(p => p.mutates),
+  }
 }

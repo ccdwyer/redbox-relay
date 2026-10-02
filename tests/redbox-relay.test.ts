@@ -2,7 +2,7 @@ import { expect, mock, test } from 'claude-code/testing'
 import type { Engine } from 'claude-code/testing'
 import type { On } from 'claude-code'
 
-import { effectOf } from '../hooks/native'
+import { effectOf, impactOf } from '../hooks/native'
 import { scrub, scrubLines } from '../hooks/logs'
 
 const RN_PKG = JSON.stringify({
@@ -33,6 +33,9 @@ type World = {
   iosFails?: boolean
   pidof?: string
   gitStatus?: () => string
+  gitHead?: () => string
+  gitDiff?: string
+  mtime?: () => number
   drop?: boolean
 }
 
@@ -48,7 +51,7 @@ function world(on: On, w: World = {}) {
   const dirs = new Set(w.dirs ?? ['/work/app/ios', '/work/app/android'])
   on('fs.read', (_$, e) => (e.path in files ? { value: files[e.path] as string } : { deny: 'ENOENT' }))
   on('fs.exists', (_$, e) => ({ value: e.path in files || dirs.has(e.path) }))
-  on('fs.stat', (_$, e) => (e.resolve ? { deny: 'ENOENT' } : { value: { kind: 'file' as const, size: 1, mtimeMs: 5, isLink: false } }))
+  on('fs.stat', (_$, e) => (e.resolve ? { deny: 'ENOENT' } : { value: { kind: 'file' as const, size: 1, mtimeMs: w.mtime === undefined ? 5 : w.mtime(), isLink: false } }))
   on('fs.list', (_$, e) => {
     const kids = [...dirs].filter(d => d.startsWith(`${e.path}/`) && !d.slice(e.path.length + 1).includes('/'))
     return kids.length === 0 ? { deny: 'ENOENT' } : { value: kids.map(d => ({ name: d.split('/').pop() as string, kind: 'dir' as const, size: 0, mtimeMs: 0, isLink: false })) }
@@ -62,6 +65,8 @@ function world(on: On, w: World = {}) {
     if (cmd === 'adb' && rest[0] === 'devices') return result(w.adb === undefined ? 'List of devices attached\n' : 'List of devices attached\nemulator-5554\tdevice\n')
     if (cmd === 'adb' && rest.includes('pidof')) return w.pidof === undefined ? result('', 1) : result(w.pidof)
     if (cmd === 'adb') return result(w.adb ?? '')
+    if (cmd === 'git' && rest[0] === 'rev-parse' && rest.includes('HEAD')) return w.gitHead === undefined ? result('', 1) : result(`${w.gitHead()}\n`)
+    if (cmd === 'git' && rest[0] === 'diff') return result(w.gitDiff ?? '')
     if (cmd === 'git' && w.gitStatus !== undefined) return result(rest[0] === 'rev-parse' ? '' : w.gitStatus())
     return result('', 1)
   })
@@ -266,7 +271,9 @@ test('builds of this app are credited, however they are spelled', () => {
   expect(builds('bash -lc "npx expo run:ios"')).toEqual(['ios'])
   expect(builds('npx react-native run-ios', { ...CTX, cwd: '/work' })).toEqual([])
   expect(pods('npx expo prebuild --platform android')).toBe(false)
-  expect(pods('bundle exec pod install')).toBe(true)
+  expect(pods('cd ios && bundle exec pod install')).toBe(true)
+  expect(pods('npx pod-install')).toBe(true)
+  expect(pods('bundle exec pod install')).toBe(false)
   expect(pods('pod install --project-directory=../other/ios')).toBe(false)
   expect(pods('npx expo run:ios')).toBe(true)
   expect(builds('ENVFILE=.env react-native run-ios')).toEqual(['ios'])
@@ -363,4 +370,101 @@ test('a credential split across Android lines is masked before any budget cut', 
   const text = await ctx($)
   expect(text).toMatch(/password/)
   expect(text).not.toMatch(/supersecret/)
+})
+
+test('react-native run-ios only installs pods when forced; expo run:ios still does', () => {
+  expect(pods('npx react-native run-ios')).toBe(false)
+  expect(builds('npx react-native run-ios')).toEqual(['ios'])
+  expect(pods('npx react-native run-ios --force-pods')).toBe(true)
+  expect(pods('npx react-native run-ios --only-pods')).toBe(true)
+  expect(builds('npx react-native run-ios --only-pods')).toEqual([])
+  expect(pods('npm run ios')).toBe(false)
+  expect(pods('npx expo run:ios')).toBe(true)
+  expect(pods('npx expo run:ios --no-install')).toBe(false)
+})
+
+test('a Podfile edit stays flagged after react-native run-ios', async ($, on) => {
+  const status = rebuildWorld(on, { dirs: ['/work/app/ios'] })
+  await $.tool.call(edit('/work/app/ios/Podfile'))
+  await $.tool.call({ tool: 'Bash', command: 'npx react-native run-ios' })
+  expect(status.text).toMatch(/pod install first/)
+})
+
+test('a build only covers native files the same command changed before it', async ($, on) => {
+  let changed = ''
+  let stamp = 1
+  world(on, { pkg: RN_PKG, gitStatus: () => changed, mtime: () => stamp })
+  on('tool.call', (_$, e) => {
+    const command = String((e as { command?: string }).command ?? '')
+    changed = command.includes('Podfile') ? ' M ios/Podfile\0' : ' M ios/MyApp/AppDelegate.swift\0'
+    stamp += 1
+    return { result: { stdout: '', stderr: '' } }
+  })
+  const text = async (command: string) => ((await $.tool.call({ tool: 'Bash', command })).context ?? []).join('\n')
+  const XB = 'xcodebuild -workspace ios/MyApp.xcworkspace -scheme MyApp build'
+  expect(await text(`${XB} && git apply native.patch`)).toMatch(/AppDelegate\.swift/)
+  expect(await text(`git apply other.patch && ${XB}`)).toBe('')
+  expect(await text(`git apply Podfile.patch && ${XB}`)).toMatch(/Podfile/)
+  expect(await text(`git apply Podfile.patch && cd ios && pod install && cd .. && ${XB}`)).toBe('')
+  expect(await text(`${XB} && cd ios && pod install`)).toMatch(/Podfile/)
+  expect(await text(`bash -lc '${XB} && git apply native.patch'`)).toMatch(/AppDelegate\.swift/)
+})
+
+test('native changes committed inside the same command are still caught', async ($, on) => {
+  let head = 'aaa'
+  world(on, { pkg: RN_PKG, gitStatus: () => '', gitHead: () => head, gitDiff: 'ios/MyApp/AppDelegate.swift\0' })
+  on('tool.call', () => {
+    head = 'bbb'
+    return { result: { stdout: '', stderr: '' } }
+  })
+  const ran = await $.tool.call({ tool: 'Bash', command: 'python3 gen.py && git add ios && git commit -m gen' })
+  expect((ran.context ?? []).join('\n')).toMatch(/AppDelegate\.swift/)
+})
+
+test('only real native trees count: a scripts/android folder does not, a module ios folder does', () => {
+  expect(impactOf('scripts/android/release.sh')).toBeNull()
+  expect(impactOf('docs/ios/notes.pdf')).toBeNull()
+  expect(impactOf('modules/camera/ios/Camera.swift')?.platforms).toEqual(['ios'])
+  expect(impactOf('modules/camera/android/src/main/AndroidManifest.xml')?.platforms).toEqual(['android'])
+  expect(impactOf('modules/camera/android/CMakeLists.txt')?.platforms).toEqual(['android'])
+  expect(impactOf('ios/MyApp/Images.xcassets/Logo.png')?.platforms).toEqual(['ios'])
+})
+
+test('masks PEM private keys and Google API keys', () => {
+  const head = '-----BEGIN ' + 'PRIVATE KEY-----'
+  const lines = scrubLines([`loaded ${head}`, 'MIIEvQIBADANBgkqhkiG9w0BAQEFAASC', 'ERROR: next line survives'])
+  expect(lines.join('\n')).not.toMatch(/MIIEvQ/)
+  expect(lines.join('\n')).toMatch(/next line survives/)
+  expect(scrub('maps key=AIza' + 'SyA1234567890abcdefghijklmnopqrstuv')).not.toMatch(/AIza/)
+})
+
+test('builds count only for this app: not an example app, not a library task', () => {
+  expect(builds('cd examples/Bare && npx expo run:ios')).toEqual([])
+  expect(builds('xcodebuild -workspace examples/Bare/ios/Bare.xcworkspace -scheme Bare build')).toEqual([])
+  expect(builds('cd android && ./gradlew :some-lib:assembleRelease')).toEqual([])
+  expect(builds('cd android && ./gradlew :app:assembleDebug')).toEqual(['android'])
+  expect(builds('npx react-native build-ios')).toEqual(['ios'])
+  expect(builds('npx react-native build-android')).toEqual(['android'])
+  expect(pods('cd ios && pod update')).toBe(true)
+  expect(pods('eas build --local --platform ios')).toBe(true)
+})
+
+test('with automaticPodsInstallation, run-ios installs pods for a Podfile change only', () => {
+  const auto = { ...CTX, autoPods: true }
+  const step = effectOf('npx react-native run-ios', auto).steps[0]
+  expect(step).toEqual({ kind: 'pods', podfileOnly: true })
+  expect(pods('npx react-native run-ios')).toBe(false)
+})
+
+test('a workspace selector run from the monorepo root counts for the selected app', () => {
+  expect(builds('pnpm --filter myapp ios', { ...CTX, cwd: '/work', root: '/work/app' })).toEqual(['ios'])
+})
+
+test('masks encrypted PEM keys with short last lines, and Google keys ending in -', () => {
+  const B = '-----BEGIN ', E = '-----END '
+  const enc = [`${B}RSA PRIVATE KEY-----`, 'Proc-Type: 4,ENCRYPTED', 'DEK-Info: AES-128-CBC,ABCDEF', '', 'MIIEvQIBADANBgkqhkiG9w0BAQEFAASC', 'QUJDRA==', `${E}RSA PRIVATE KEY-----`, 'after']
+  const out = scrubLines(enc).join('\n')
+  expect(out).not.toMatch(/MIIEvQ|QUJDRA|ENCRYPTED/)
+  expect(out).toMatch(/after/)
+  expect(scrub('k="AIza' + 'SyA1234567890abcdefghijklmnopqrstu-"')).not.toMatch(/AIza/)
 })
