@@ -527,7 +527,11 @@ export const register: Register = on => {
       const pendingNow = await read($, pending)
       const roots = [...new Set([...apps.map(a => a.root), ...pendingNow.map(p => p.root)])]
       const watch = mayWrite(e.command) ? apps : []
-      const before = await Promise.all(watch.map(a => snapshot($, a.root)))
+      const before: (Snap | null)[] = []
+      for (const watched of watch) {
+        const watchedRoot = watched.root
+        before.push(await snapshot($, watchedRoot))
+      }
       const startedAt = await read($, gen)
 
       const ran = await next(e)
@@ -555,7 +559,8 @@ export const register: Register = on => {
       for (const [i, app] of watch.entries()) {
         const was = before[i]
         if (was === null || was === undefined) continue
-        const after = await snapshot($, app.root)
+        const appRoot = app.root
+        const after = await snapshot($, appRoot)
         if (after === null) continue
         // Files changed in either direction, a revert to the committed version included.
         for (const rel of new Set([...was.keys(), ...after.keys()])) {
