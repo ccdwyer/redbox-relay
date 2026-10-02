@@ -8,5 +8,9 @@
     "url": "https://github.com/ccdwyer"
   },
   "repository": "https://github.com/ccdwyer/redbox-relay",
-  "license": "MIT"
+  "license": "MIT",
+  "homepage": "https://github.com/ccdwyer/redbox-relay",
+  "supportUrl": "https://github.com/ccdwyer/redbox-relay/issues",
+  "documentationUrl": "https://github.com/ccdwyer/redbox-relay#readme",
+  "privacyPolicyUrl": "https://github.com/ccdwyer/redbox-relay/blob/main/PRIVACY.md"
 }
