@@ -1,5 +1,9 @@
 # Redbox Relay
 
+![Redbox Relay demo](media/demo.gif)
+
+*Claude edits `Info.plist` and the `Podfile`; Redbox Relay tells it a JS reload won't pick this up, and the status line tracks the pending native rebuild. ([MP4](media/demo.mp4))*
+
 A Claude Code mod for React Native work: the model sees what the running app just threw, without you copy-pasting redboxes.
 
 - **Fresh errors on every prompt.** When you send a message in a React Native or Expo project (monorepo workspaces included), Redbox Relay reads every booted iOS Simulator (`xcrun simctl … log show`) and every connected Android device or emulator (`adb logcat`). For each device it reads back to its last successful read, and never more than 3 minutes. It keeps JS errors, unhandled JS exceptions, `RCTFatal`, Java crashes and native tombstones, each message together with its stack, but only from your app's process. The process is matched by app name, by package id (via `pidof` on Android), or by Expo Go for managed Expo projects (no native folders of their own). Other apps' logs on the same device, React Native or not, are left out, and nothing is guessed. Copies within one read are deduped. An error already attached isn't sent again, but the same error thrown again later is. Each device gets a fair share of a 40-line budget, newest events first, each from its top. When events don't fit, a note says how many were left out, and `/redbox` shows more. Bearer tokens, JWTs, auth and cookie headers, URL passwords, common API keys and `token=`/`password=` values are masked. The result is attached to your prompt as context, and a toast says how many lines went in.
