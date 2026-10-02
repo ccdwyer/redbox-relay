@@ -1,0 +1,11 @@
+{
+  "name": "redbox-relay",
+  "version": "0.1.0",
+  "description": "Attaches fresh React Native redboxes and native crash logs from running simulators and emulators to your prompt, and warns when an edit needs a native rebuild",
+  "types": "./types/index.d.ts",
+  "author": {
+    "name": "Chris Dwyer",
+    "url": "https://github.com/ccdwyer"
+  },
+  "repository": "https://github.com/ccdwyer/redbox-relay"
+}

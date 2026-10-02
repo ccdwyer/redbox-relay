@@ -1,0 +1,13 @@
+{
+  "name": "redbox-relay",
+  "owner": {
+    "name": "Chris Dwyer"
+  },
+  "plugins": [
+    {
+      "name": "redbox-relay",
+      "source": "./",
+      "description": "Attaches fresh React Native redboxes and native crash logs from running simulators and emulators to your prompt, and warns when an edit needs a native rebuild"
+    }
+  ]
+}
