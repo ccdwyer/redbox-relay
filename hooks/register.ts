@@ -400,10 +400,9 @@ type Snap = Map<string, { mtime: number; text?: string }>
 // text of the config files whose meaning depends on content): the before/after
 // snapshot that catches native edits made through the shell.
 async function snapshot($: EngineInterface, root: string): Promise<Snap | null> {
-  const [prefix, status] = await Promise.all([
-    run($, ['git', 'rev-parse', '--show-prefix'], 4000, root),
-    run($, ['git', 'status', '--porcelain=v1', '-z', '--untracked-files=all', '--', '.'], 4000, root),
-  ])
+  // One after the other: the directory reads $ only as a plain argument, not inside an array literal.
+  const prefix = await run($, ['git', 'rev-parse', '--show-prefix'], 4000, root)
+  const status = await run($, ['git', 'status', '--porcelain=v1', '-z', '--untracked-files=all', '--', '.'], 4000, root)
   if (prefix === null || status === null || prefix.exitCode !== 0 || status.exitCode !== 0) return null
   // git reports paths from the repository's top; make them relative to the app.
   const lead = prefix.stdout.trim()
